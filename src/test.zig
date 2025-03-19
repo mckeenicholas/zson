@@ -1,5 +1,5 @@
 const std = @import("std");
-const Json = @import("json.zig");
+const zson = @import("root.zig");
 
 test "JsonValue creation and manipulation" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -7,34 +7,34 @@ test "JsonValue creation and manipulation" {
     const allocator = gpa.allocator();
 
     // Test null value
-    var null_value = Json.JsonValue.null(allocator);
+    var null_value = zson.null(allocator);
     defer null_value.deinit();
     try std.testing.expect(null_value.isNull());
 
     // Test boolean value
-    var bool_value = Json.JsonValue.boolean(allocator, true);
+    var bool_value = zson.boolean(allocator, true);
     defer bool_value.deinit();
     try std.testing.expect(bool_value.isBoolean());
     try std.testing.expect(try bool_value.getBool() == true);
 
     // Test number value
-    var number_value = Json.JsonValue.number(allocator, 42.0);
+    var number_value = zson.number(allocator, 42.0);
     defer number_value.deinit();
     try std.testing.expect(number_value.isNumber());
     try std.testing.expect(try number_value.getNumber() == 42.0);
 
     // Test string value
     const test_str = "hello";
-    var string_value = try Json.JsonValue.string(allocator, test_str);
+    var string_value = try zson.string(allocator, test_str);
     defer string_value.deinit();
     try std.testing.expect(string_value.isString());
     try std.testing.expect(std.mem.eql(u8, try string_value.getString(), test_str));
 
     // Test array value
-    var array_value = try Json.JsonValue.array(allocator);
+    var array_value = try zson.array(allocator);
     defer array_value.deinit();
     {
-        const num_for_array = Json.JsonValue.number(allocator, 42.0);
+        const num_for_array = zson.number(allocator, 42.0);
         try array_value.append(num_for_array);
     }
     try std.testing.expect(array_value.isArray());
@@ -43,10 +43,10 @@ test "JsonValue creation and manipulation" {
     try std.testing.expect(try array_item.getNumber() == 42.0);
 
     // Test object value
-    var object_value = try Json.JsonValue.object(allocator);
+    var object_value = try zson.object(allocator);
     defer object_value.deinit();
     {
-        const str_for_obj = try Json.JsonValue.string(allocator, test_str);
+        const str_for_obj = try zson.string(allocator, test_str);
         try object_value.put("key", str_for_obj);
     }
     try std.testing.expect(object_value.isObject());
@@ -83,17 +83,17 @@ test "JsonValue toStruct and toJsonValue" {
         \\}
     ;
 
-    var json_value = try Json.JsonValue.parse(allocator, json_str);
+    var json_value = try zson.parse(allocator, json_str);
     defer json_value.deinit();
 
-    const person = try json_value.toStruct(Person);
+    const person = try zson.toStruct(json_value, Person);
     try std.testing.expect(std.mem.eql(u8, person.name, "John Doe"));
     try std.testing.expect(person.age == null);
     try std.testing.expect(std.mem.eql(u8, person.addr.street, "9641 W Sunset Blvd"));
     try std.testing.expect(std.mem.eql(u8, person.addr.city, "Beverly Hills"));
     try std.testing.expect(person.addr.zip == 90210);
 
-    var json_value_back = try Json.JsonValue.toJsonValue(Person, person, allocator);
+    var json_value_back = try zson.toJsonValue(Person, person, allocator);
     defer json_value_back.deinit();
     const stdout = std.io.getStdOut().writer();
     try json_value_back.print(stdout);
@@ -116,7 +116,7 @@ test "Parser functionality" {
         \\  }
         \\}
     ;
-    var json_value = try Json.JsonValue.parse(allocator, json_str);
+    var json_value = try zson.parse(allocator, json_str);
     defer json_value.deinit();
 
     const name = try (try json_value.getField("name")).getString();

@@ -67,6 +67,22 @@ pub const JsonValue = struct {
         };
     }
 
+    pub fn objectWithCapacity(allocator: std.mem.Allocator, capacity: u32) !Self {
+        var map = std.StringHashMap(JsonValue).init(allocator);
+        try map.ensureTotalCapacity(capacity);
+        return .{
+            .data = .{ .Object = map },
+            .allocator = allocator,
+        };
+    }
+
+    pub fn arrayWithCapacity(allocator: std.mem.Allocator, capacity: u32) !Self {
+        return .{
+            .data = .{ .Array = try std.ArrayList(JsonValue).initCapacity(allocator, capacity) },
+            .allocator = allocator,
+        };
+    }
+
     pub fn put(self: *Self, key: []const u8, value: JsonValue) !void {
         switch (self.data) {
             .Object => |*obj| {
@@ -113,6 +129,36 @@ pub const JsonValue = struct {
     pub fn parse(allocator: std.mem.Allocator, input: []const u8) !JsonValue {
         var parseObject = parser.new(allocator, input);
         return try parseObject.parseValue();
+    }
+
+    pub fn deepCopy(self: Self) !Self {
+        return try self.deepCopyWithAllocator(self.allocator);
+    }
+
+    pub fn deepCopyWithAllocator(self: Self, new_allocator: std.mem.Allocator) !Self {
+        return switch (self.data) {
+            .Null => JsonValue.null(new_allocator),
+            .Boolean => |b| JsonValue.boolean(new_allocator, b),
+            .Number => |n| JsonValue.number(new_allocator, n),
+            .String => |s| try JsonValue.string(new_allocator, s),
+            .Array => |arr| blk: {
+                var new_arr = try JsonValue.array(new_allocator);
+                for (arr.items) |item| {
+                    const item_copy = try item.deepCopyWithAllocator(new_allocator);
+                    try new_arr.append(item_copy);
+                }
+                break :blk new_arr;
+            },
+            .Object => |obj| blk: {
+                var new_obj = try JsonValue.object(new_allocator);
+                var it = obj.iterator();
+                while (it.next()) |entry| {
+                    const value_copy = try entry.value_ptr.*.deepCopyWithAllocator(new_allocator);
+                    try new_obj.put(entry.key_ptr.*, value_copy);
+                }
+                break :blk new_obj;
+            },
+        };
     }
 
     pub fn dump(self: Self, writer: anytype) !void {
@@ -275,94 +321,104 @@ pub const JsonValue = struct {
         KeyNotFound,
     } || GetError;
 
+    pub fn parseEnum(self: Self, comptime T: enum {}) !T {
+        if (!self.isString()) return error.WrongType;
+        const str = try self.getString();
+
+        inline for (@typeInfo(T).Enum.fields) |field| {
+            if (std.mem.eql(u8, str, field.name)) {
+                return @intFromEnum(T);
+            }
+        }
+
+        return error.KeyNotFound;
+    }
+
     pub fn toStruct(self: Self, comptime T: type) ToStructError!T {
-        switch (@typeInfo(T)) {
-            .@"struct" => |info| {
+        return switch (@typeInfo(T)) {
+            .@"struct" => blk_struct: {
+                if (T == JsonValue) {
+                    return try T.deepCopy();
+                }
+
+                const info = @typeInfo(T).@"struct";
+                if (@hasDecl(T, "KV") and info.fields.len >= 2) {
+                    const is_hash_map = @hasField(T, "hash_map") or
+                        std.mem.indexOf(u8, @typeName(T), "StringHashMap") != null;
+                    if (is_hash_map and self.data == .Object) {
+                        // Extract value type from StringHashMap
+                        const value_type = @typeInfo(info.fields[1].type).Pointer.child;
+
+                        var result = T.init(self.allocator);
+                        var it = self.data.Object.iterator();
+                        while (it.next()) |entry| {
+                            const key_owned = try self.allocator.dupe(u8, entry.key_ptr.*);
+                            const value = try entry.value_ptr.*.toStruct(value_type);
+                            try result.put(key_owned, value);
+                        }
+                        return result;
+                    }
+                }
+
                 if (self.data != .Object) return error.WrongType;
                 var result: T = undefined;
 
-                inline for (info.fields) |field| {
-                    const field_type = field.type;
+                inline for (@typeInfo(T).@"struct".fields) |field| {
                     const field_name = field.name;
-
-                    // Check if field is optional
+                    const field_type = field.type;
                     const is_optional = @typeInfo(field_type) == .optional;
 
-                    // Get the field value
-                    const maybe_value: ?JsonValue = if (is_optional) blk: {
-                        const field_value = self.getField(field_name) catch |err| switch (err) {
-                            error.KeyNotFound => {
-                                @field(result, field_name) = null;
-                                break :blk null;
-                            },
+                    // Handle optional fields
+                    if (is_optional) {
+                        // Try to get field, set to null if missing or null in JSON
+                        const maybe_value: ?JsonValue = self.getField(field_name) catch |err| switch (err) {
+                            error.KeyNotFound => null,
                             else => |e| return e,
                         };
-                        if (field_value.isNull()) {
-                            @field(result, field_name) = null;
-                            break :blk null;
-                        }
-                        break :blk field_value;
-                    } else self.getField(field_name) catch |err| switch (err) {
-                        error.KeyNotFound => return error.RequiredFieldMissing,
-                        else => |e| return e,
-                    };
 
-                    if (maybe_value != null) {
-                        const value = maybe_value orelse unreachable;
+                        @field(result, field_name) = if (maybe_value != null and !maybe_value.?.isNull()) blk_eval_optional: {
+                            const field_value = maybe_value orelse unreachable;
+                            // Extract the child type from the optional
+                            const child_type = @typeInfo(field_type).optional.child;
 
-                        const actual_type = if (is_optional)
-                            @typeInfo(field_type).optional.child
-                        else
-                            field_type;
-
-                        @field(result, field_name) = switch (@typeInfo(actual_type)) {
-                            .int => blk: {
-                                const num = try value.getNumber();
-                                if (@mod(num, 1) != 0) {
-                                    std.debug.print("Warning: Converting non-integer {d} to integer\n", .{num});
-                                }
-                                break :blk @intFromFloat(num);
-                            },
-                            .float => try value.getNumber(),
-                            .bool => try value.getBool(),
-                            .@"struct" => try value.toStruct(actual_type),
-                            .array => |arr_info| blk: {
-                                if (!value.isArray()) return error.WrongType;
-                                var arr: actual_type = undefined;
-                                const len = try value.length();
-                                if (len > arr_info.len) return error.WrongType;
-                                for (0..len) |i| {
-                                    const item = try value.getIndex(i);
-                                    arr[i] = try item.toStruct(arr_info.child);
-                                }
-                                break :blk arr;
-                            },
-                            .pointer => |ptr_info| switch (ptr_info.size) {
-                                .slice => if (ptr_info.child == u8) blk: {
-                                    break :blk try value.getString();
-                                } else {
-                                    return error.WrongType;
-                                },
-                                else => return error.WrongType,
-                            },
-                            else => return error.WrongType,
+                            // Recursively convert the value
+                            break :blk_eval_optional try field_value.toStruct(child_type);
+                        } else null;
+                    }
+                    // Handle required fields
+                    else {
+                        const field_value = self.getField(field_name) catch |err| switch (err) {
+                            error.KeyNotFound => return error.RequiredFieldMissing,
+                            else => |e| return e,
                         };
+
+                        // Recursively convert the value
+                        @field(result, field_name) = try field_value.toStruct(field_type);
                     }
                 }
-                return result;
+                break :blk_struct result;
             },
-            // TODO: Add StringHashMap as valid entry for type.
-            .int => {
+            .int => blk: {
                 const num = try self.getNumber();
-
                 if (@mod(num, 1) != 0) {
                     std.debug.print("Warning: Converting non-integer {d} to integer\n", .{num});
                 }
-
-                return @intFromFloat(num);
+                break :blk @intFromFloat(num);
             },
-            .float => return try self.getNumber(),
-            .bool => return try self.getBool(),
+            .float => try self.getNumber(),
+            .bool => try self.getBool(),
+            .array => |arr_info| blk: {
+                if (!self.isArray()) return error.WrongType;
+                var arr: T = undefined;
+                const len = try self.length();
+                if (len > arr_info.len) return error.WrongType;
+
+                for (0..len) |i| {
+                    const item = try self.getIndex(i);
+                    arr[i] = try item.toStruct(arr_info.child);
+                }
+                break :blk arr;
+            },
             .pointer => |ptr_info| switch (ptr_info.size) {
                 .slice => if (ptr_info.child == u8) {
                     return try self.getString();
@@ -372,12 +428,35 @@ pub const JsonValue = struct {
                 else => return error.WrongType,
             },
             else => return error.WrongType,
-        }
+        };
     }
 
     pub fn toJsonValue(comptime T: type, value: T, allocator: std.mem.Allocator) !JsonValue {
         switch (@typeInfo(T)) {
             .@"struct" => |info| {
+                if (T == JsonValue) {
+                    return try T.deepCopy();
+                }
+
+                if (@hasDecl(T, "KV") and info.fields.len >= 2) {
+                    const is_hash_map = @hasField(T, "hash_map") or
+                        std.mem.indexOf(u8, @typeName(T), "StringHashMap") != null;
+                    if (is_hash_map) {
+                        var json_obj = try JsonValue.object(allocator);
+
+                        // Extract value type from StringHashMap
+                        const value_type = @typeInfo(info.fields[1].type).Pointer.child;
+
+                        // Iterate over all keys and values in the hash map
+                        var it = value.iterator();
+                        while (it.next()) |entry| {
+                            const json_field_value = try toJsonValue(value_type, entry.value_ptr.*, allocator);
+                            try json_obj.put(entry.key_ptr.*, json_field_value);
+                        }
+                        return json_obj;
+                    }
+                }
+
                 var json_obj = try JsonValue.object(allocator);
                 inline for (info.fields) |field| {
                     const field_name = field.name;

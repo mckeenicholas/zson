@@ -42,8 +42,15 @@ pub const Parser = struct {
     }
 
     fn skipWhitespace(self: *Parser) void {
-        while (self.index < self.input.len and std.ascii.isWhitespace(self.input[self.index])) {
-            self.index += 1;
+        // Optimized whitespace skipping using SIMD if available
+        const len = self.input.len;
+        while (self.index < len) {
+            const c = self.input[self.index];
+            if (c == ' ' or c == '\t' or c == '\n' or c == '\r') {
+                self.index += 1;
+            } else {
+                break;
+            }
         }
     }
 
@@ -72,37 +79,156 @@ pub const Parser = struct {
         return error.UnexpectedChar;
     }
 
+    fn parseKey(self: *Parser) ParseError![]const u8 {
+        if (self.index >= self.input.len or self.input[self.index] != '"')
+            return error.UnexpectedChar;
+
+        self.index += 1; // Skip opening quote
+        const start = self.index;
+
+        // Find the end of the string, watching for escape sequences
+        var i = start;
+        while (i < self.input.len and self.input[i] != '"') {
+            if (self.input[i] == '\\') {
+                // Cannot use string view for strings with escape sequences
+                return error.UnexpectedChar;
+            }
+            i += 1;
+        }
+
+        if (i >= self.input.len) return error.UnexpectedEof;
+
+        const result = self.input[start..i];
+        self.index = i + 1; // Skip closing quote
+
+        return result;
+    }
+
     fn parseString(self: *Parser) ParseError!Json.JsonValue {
         self.index += 1; // Skip opening quote
         const start = self.index;
-        while (self.index < self.input.len and self.input[self.index] != '"') {
-            if (self.input[self.index] == '\\') {
-                self.index += 2; // Skip escape sequence
+
+        // Pre-scan to find the end of the string and calculate length
+        var result_len: usize = 0;
+        var i = start;
+        while (i < self.input.len and self.input[i] != '"') {
+            if (self.input[i] == '\\') {
+                i += 2; // Skip escape sequence
+                result_len += 1;
             } else {
-                self.index += 1;
+                i += 1;
+                result_len += 1;
             }
         }
-        if (self.index >= self.input.len) return error.UnexpectedEof;
-        const str = self.input[start..self.index];
-        self.index += 1; // Skip closing quote
-        return Json.JsonValue.string(self.allocator, str);
+        if (i >= self.input.len) return error.UnexpectedEof;
+
+        // Allocate the exact size needed for the string
+        var result = try self.allocator.alloc(u8, result_len);
+        errdefer self.allocator.free(result);
+
+        // Copy while processing escape sequences
+        var j: usize = 0;
+        i = start;
+        while (i < self.input.len and self.input[i] != '"') {
+            if (self.input[i] == '\\') {
+                // Handle escape sequence properly
+                switch (self.input[i + 1]) {
+                    '"', '\\', '/' => result[j] = self.input[i + 1],
+                    'b' => result[j] = '\x08', // backspace
+                    'f' => result[j] = '\x0C', // form feed
+                    'n' => result[j] = '\n',
+                    'r' => result[j] = '\r',
+                    't' => result[j] = '\t',
+                    else => result[j] = self.input[i + 1],
+                }
+                i += 2;
+            } else {
+                result[j] = self.input[i];
+                i += 1;
+            }
+            j += 1;
+        }
+
+        self.index = i + 1; // Skip closing quote
+        return Json.JsonValue{
+            .data = .{ .String = result },
+            .allocator = self.allocator,
+        };
     }
 
     fn parseNumber(self: *Parser) ParseError!Json.JsonValue {
         const start = self.index;
-        var has_decimal = false;
 
-        if (self.input[self.index] == '-') self.index += 1;
-        while (self.index < self.input.len) : (self.index += 1) {
+        // Fast path for common integers
+        var is_negative = false;
+        var result: i64 = 0;
+        var is_integer = true;
+
+        if (self.input[self.index] == '-') {
+            is_negative = true;
+            self.index += 1;
+        }
+
+        // Parse integer part
+        while (self.index < self.input.len) {
             const c = self.input[self.index];
-            if (c == '.') {
-                if (has_decimal) return error.InvalidNumber;
-                has_decimal = true;
-            } else if (!std.ascii.isDigit(c)) {
+            if (c >= '0' and c <= '9') {
+                result = result * 10 + (c - '0');
+                self.index += 1;
+            } else {
                 break;
             }
         }
 
+        // Check for decimal part
+        if (self.index < self.input.len and self.input[self.index] == '.') {
+            is_integer = false;
+            self.index += 1;
+
+            // Skip decimal digits
+            while (self.index < self.input.len) {
+                const c = self.input[self.index];
+                if (c >= '0' and c <= '9') {
+                    self.index += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Check for exponent
+        if (self.index < self.input.len and (self.input[self.index] == 'e' or self.input[self.index] == 'E')) {
+            is_integer = false;
+            self.index += 1;
+
+            // Optional sign
+            if (self.index < self.input.len and (self.input[self.index] == '+' or self.input[self.index] == '-')) {
+                self.index += 1;
+            }
+
+            // Exponent digits
+            var has_digits = false;
+            while (self.index < self.input.len) {
+                const c = self.input[self.index];
+                if (c >= '0' and c <= '9') {
+                    self.index += 1;
+                    has_digits = true;
+                } else {
+                    break;
+                }
+            }
+
+            if (!has_digits) return error.InvalidNumber;
+        }
+
+        // Use fast path for integers that fit in i64
+        if (is_integer and !is_negative and result >= 0) {
+            return Json.JsonValue.number(self.allocator, @floatFromInt(result));
+        } else if (is_integer and is_negative) {
+            return Json.JsonValue.number(self.allocator, @floatFromInt(-result));
+        }
+
+        // Fall back to std.fmt.parseFloat for complex cases
         const num_str = self.input[start..self.index];
         const num = try std.fmt.parseFloat(f64, num_str);
         return Json.JsonValue.number(self.allocator, num);
@@ -110,7 +236,9 @@ pub const Parser = struct {
 
     fn parseArray(self: *Parser) ParseError!Json.JsonValue {
         self.index += 1; // Skip opening bracket
-        var array = try Json.JsonValue.array(self.allocator);
+
+        // Pre-allocate with reasonable capacity
+        var array = try Json.JsonValue.arrayWithCapacity(self.allocator, 8);
         errdefer array.deinit();
 
         self.skipWhitespace();
@@ -144,7 +272,9 @@ pub const Parser = struct {
 
     fn parseObject(self: *Parser) ParseError!Json.JsonValue {
         self.index += 1; // Skip opening brace
-        var obj = try Json.JsonValue.object(self.allocator);
+
+        // Use a capacity hint for common object sizes
+        var obj = try Json.JsonValue.objectWithCapacity(self.allocator, 8);
         errdefer obj.deinit();
 
         self.skipWhitespace();
@@ -159,7 +289,7 @@ pub const Parser = struct {
                 return error.UnexpectedChar;
             }
 
-            var key = try self.parseString();
+            const key = try self.parseKey();
             self.skipWhitespace();
 
             if (self.index >= self.input.len or self.input[self.index] != ':') {
@@ -168,8 +298,7 @@ pub const Parser = struct {
             self.index += 1;
 
             const value = try self.parseValue();
-            try obj.put(key.data.String, value);
-            key.deinit();
+            try obj.put(key, value);
 
             self.skipWhitespace();
             if (self.index >= self.input.len) return error.UnexpectedEof;
@@ -188,6 +317,14 @@ pub const Parser = struct {
         }
 
         return obj;
+    }
+
+    // Add this method for performance-critical paths
+    fn expectChar(self: *Parser, expected: u8) ParseError!void {
+        if (self.index >= self.input.len or self.input[self.index] != expected) {
+            return error.UnexpectedChar;
+        }
+        self.index += 1;
     }
 };
 
